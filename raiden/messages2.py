@@ -17,6 +17,15 @@ from raiden.utils import (
 )
 
 
+def _reveal_type(_type: type) -> type:
+    """Return the actual type, even if type is a ClassVar, InitVar or NewType"""
+    return (
+        getattr(_type, '__type__', None) or
+        getattr(_type, '__supertype__', None) or
+        _type
+    )
+
+
 @dataclass(frozen=True)
 class BytesEncodableFieldsMixin:
     """Provides the base for a dataclass that can be [de]serializable to/from bytes
@@ -33,12 +42,52 @@ class BytesEncodableFieldsMixin:
     cmdid: ClassVar[int] = field(default=None, metadata={'format': 'H'})
 
     @classmethod
-    def prefix_fields(cls) -> Tuple[Field]:
+    def _prefix_fields(cls) -> Tuple[Field]:
         """Return a tuple of fields to be used as standard prefix for to|from_bytes"""
         return (
             cls.__dataclass_fields__['magic_number'],
             cls.__dataclass_fields__['cmdid']
         )
+
+    @classmethod
+    def _calc_binary_fields(cls, _fields: Iterable[Union[str, Field]]=None) -> Tuple[Field]:
+        """Calculate the valid _fields iterable to be serialized"""
+        # if _fields parameter is set, use list of names in given order,
+        # not including self._prefix_fields()
+        if _fields:
+            _fields = [
+                cls.__dataclass_fields__[field_or_name]
+                if isinstance(field_or_name, str)
+                else field_or_name
+                for field_or_name in _fields
+            ]
+        else:  # by default, use all fields, including self._prefix_fields()
+            _fields = cls._prefix_fields() + fields(cls)
+
+        for _field in _fields:
+            _type = _reveal_type(_field.type)
+            if issubclass(_type, BytesEncodableFieldsMixin):
+                _field.metadata['format'] = f'{_type.calcsize()}s'
+
+        _fields = [  # filter for valid metadata
+            _field
+            for _field in _fields
+            if getattr(_field, 'metadata', {}).get('format')
+        ]
+        return tuple(_fields)
+
+    @classmethod
+    def _calc_format(cls, _fields: Iterable[Field]) -> str:
+        """Calculate the struct format string to be (en|de)coded"""
+        # '!' => network byte-alignment=big-endian
+        return '!' + ''.join(_field.metadata['format'] for _field in _fields)
+
+    @classmethod
+    def calcsize(cls, _fields: Iterable[Union[str, Field]]=None) -> int:
+        """Caculate the size of the serialized bytes for the given _fields"""
+        _fields = cls._calc_binary_fields(_fields=_fields)
+        fmt = cls._calc_format(_fields)
+        return struct.calcsize(fmt)
 
     def to_bytes(self, _fields: Iterable[Union[str, Field]]=None) -> bytes:
         """Serializes this object into bytes
@@ -46,25 +95,8 @@ class BytesEncodableFieldsMixin:
         The serialization is made based on a 'format' key on field.metadata dict
         @param _fields: list of ordered fields or field names to be serialized
         """
-        # if _fields parameter is set, use list of names in given order,
-        # not including self.prefix_fields()
-        if _fields:
-            _fields = [
-                self.__dataclass_fields__[field_or_name]
-                if isinstance(field_or_name, str)
-                else field_or_name
-                for field_or_name in _fields
-            ]
-        else:  # by default, use all fields, including self.prefix_fields()
-            _fields = self.prefix_fields() + fields(self)
-
-        _fields = [  # filter for valid metadata
-            _field
-            for _field in _fields
-            if getattr(_field, 'metadata', {}).get('format')
-        ]
-
-        fmt = '!'  # network byte-alignment=big-endian
+        _fields = self._calc_binary_fields(_fields=_fields)
+        fmt = self._calc_format(_fields=_fields)
         values = []
 
         for _field in _fields:
@@ -72,12 +104,16 @@ class BytesEncodableFieldsMixin:
             value = getattr(self, _field.name)
             if _fmt.endswith('s'):
                 # accept '(\d+)s' formats for integers, including in ClassVar's
-                if int in (_field.type, getattr(_field.type, '__type__', None)):
+                _type = _reveal_type(_field.type)
+                # encode big integers
+                if _type is int:
                     value = value.to_bytes(struct.calcsize(_fmt), byteorder='big')
+                # support recursively messages as fields
+                elif issubclass(_type, BytesEncodableFieldsMixin):
+                    value = value.to_bytes()
                 # test bytes for exact size
                 if not isinstance(value, bytes) or len(value) != struct.calcsize(_fmt):
                     raise struct.error('Invalid bytes type or size')
-            fmt += _fmt
             values.append(value)
 
         # use struct.pack to format values
@@ -86,36 +122,21 @@ class BytesEncodableFieldsMixin:
     @classmethod
     def from_bytes(cls, data: bytes, _fields: Iterable[Union[str, Field]]=None) -> 'cls':
         """Constructs an object based on binary packed data"""
-        # if _fields parameter is set, use list of names in given order,
-        # not including self.prefix_fields()
-        if _fields:
-            _fields = [
-                cls.__dataclass_fields__[field_or_name]
-                if isinstance(field_or_name, str)
-                else field_or_name
-                for field_or_name in _fields
-            ]
-        else:  # by default, use all fields, including self.prefix_fields()
-            _fields = cls.prefix_fields() + fields(cls)
-
-        _fields = [  # filter for valid metadata
-            _field
-            for _field in _fields
-            if getattr(_field, 'metadata', {}).get('format')
-        ]
-
-        fmt = '!'  # network byte-alignment=big-endian
-        for _field in _fields:
-            fmt += _field.metadata['format']
+        _fields = cls._calc_binary_fields(_fields=_fields)
+        fmt = cls._calc_format(_fields=_fields)
 
         # use struct.unpack to get values
         values = struct.unpack(fmt, data)
         assert len(_fields) == len(values), 'Names and values of different size'
 
-        for i, _field in enumerate(_fields):
+        for i, (_field, value) in enumerate(zip(_fields, values)):
+            _type = _reveal_type(_field.type)
             # accept '(\d+)s' formats for integers (decode bytes)
-            if _field.type is int and _field.metadata['format'].endswith('s'):
-                values[i] = int.from_bytes(values[i], byteorder='big')
+            if _type is int and _field.metadata['format'].endswith('s'):
+                values[i] = int.from_bytes(value, byteorder='big')
+            # support recursively messages as fields (decode bytes)
+            elif issubclass(_type, BytesEncodableFieldsMixin):
+                values[i] = _type.from_bytes(value)
 
         params = dict(zip([_field.name for _field in _fields], values))
         if 'magic_number' in params:
@@ -142,10 +163,16 @@ class DictEncodableFieldsMixin:
         names = set(_field.name for _field in _fields)
         assert data.keys() <= names,\
             f'Dict contains keys not present in type: {data.keys()-names!r}'
+        for _field in _fields:
+            _type = _reveal_type(_field.type)
+            # support recursively messages as fields
+            if _field.name in data and issubclass(_type, DictEncodableFieldsMixin):
+                data[_field.name] = _type.from_dict(data[_field.name])
+
         assert all(
             isinstance(
                 data.get(_field.name),
-                (type(None), _field.type, getattr(_field.type, '__type__', None))
+                (type(None), _reveal_type(_field.type))
             )
             for _field in _fields
         ), f'Some dict values are of the wrong type in {data!r}'
@@ -159,6 +186,22 @@ class Message(DictEncodableFieldsMixin, BytesEncodableFieldsMixin):
     def hash(self):
         return sha3(self.to_bytes())
 
+    @classmethod
+    def message_from_bytes(cls, data: bytes) -> 'Message':
+        """Classmethod as entrypoint to decode a message from full bytes array"""
+        prefix_fields = cls._prefix_fields()
+        cmdid_index = [_field.name for _field in prefix_fields].index('cmdid')
+        fmt = cls._calc_format(_fields=prefix_fields)
+        size = cls.calcsize(_fields=prefix_fields)
+        values = struct.unpack(fmt, data[:size])
+        cmdid = values[cmdid_index]
+        return _CMDID_TO_CLASS[cmdid].from_bytes(data)
+
+    @classmethod
+    def message_from_dict(cls, data: dict) -> 'Message':
+        """Classmethod as entrypoint to decode a message from dict"""
+        return _CLASSNAME_TO_CLASS[data['type']].from_dict(data)
+
 
 @dataclass(frozen=True)
 class SignedMessage(Message):
@@ -166,26 +209,18 @@ class SignedMessage(Message):
     # signature field without 'format' metadata -> won't be included in super().to_bytes()
     signature: bytes = field(metadata={'format': '65s'})
 
-    def to_bytes(self, _fields: Iterable[Union[str, Field]]=None) -> bytes:
-        """Like Message.to_bytes, but ensure signature is last field"""
-        if not _fields:
-            # if _fields not explicitly set, signature goes last
-            _fields = list(self.prefix_fields()) + sorted(
-                fields(self),
-                key=lambda _field: _field.name == 'signature'
-            )
-        return super().to_bytes(_fields=_fields)
-
     @classmethod
-    def from_bytes(cls, data: bytes, _fields: Iterable[Union[str, Field]]=None) -> 'cls':
-        """Like Message.from_bytes, but ensure signature is last field"""
-        if not _fields:
-            # if _fields not explicitly set, signature goes last
-            _fields = list(cls.prefix_fields()) + sorted(
-                fields(cls),
-                key=lambda _field: _field.name == 'signature'
-            )
-        return super().from_bytes(data, _fields=_fields)
+    def _calc_binary_fields(cls, _fields: Iterable[Union[str, Field]]=None) -> Tuple[Field]:
+        """Like Message._calc_binary_fields, but ensure 'signature' goes last"""
+        _fields = super()._calc_binary_fields(_fields=_fields)
+        return tuple(sorted(_fields, key=lambda _field: _field.name == 'signature'))
+
+    @property
+    def hash(self):
+        """Exclude 'signature' from SignedMessage.hash calculation"""
+        *_fields, sig_field = self._calc_binary_fields()
+        assert sig_field.name == 'signature'
+        return sha3(self.to_bytes(_fields=_fields))
 
     def data_to_sign(self) -> bytes:
         """Return a binary-encoded representation to be signed
@@ -193,11 +228,8 @@ class SignedMessage(Message):
         By default, it just packs all fields, except 'signature', in reverse MRO order
         @return: to_bytes() only of fields to be signed
         """
-        _fields = list(self.prefix_fields()) + [
-            _field
-            for _field in fields(self)
-            if _field.name != 'signature'
-        ]
+        *_fields, sig_field = self._calc_binary_fields()
+        assert sig_field.name == 'signature'
         return self.to_bytes(_fields=_fields)
 
     def signed(self, private_key: 'PrivateKey') -> 'SignedMessage':
@@ -217,16 +249,6 @@ class SignedMessage(Message):
             return None
         data = self.data_to_sign()
         return signing.recover_address(data, self.signature)
-
-    @property
-    def hash(self):
-        """Exclude 'signature' from SignedMessage.hash calculation"""
-        _fields = list(self.prefix_fields()) + [
-            _field
-            for _field in fields(self)
-            if _field.name != 'signature'
-        ]
-        return sha3(self.to_bytes(_fields=_fields))
 
 
 @dataclass(frozen=True)
@@ -259,7 +281,7 @@ class SecretRequest(SignedMessage):
     message_identifier: int = field(metadata={'format': 'Q'})
     payment_identifier: int = field(metadata={'format': 'Q'})
     secrethash: bytes = field(metadata={'format': '32s'})
-    amount: bytes = field(metadata={'format': '32s'})
+    amount: int = field(metadata={'format': '32s'})
 
 
 @dataclass(frozen=True)
@@ -275,7 +297,7 @@ class RevealSecret(SignedMessage):
 
 @dataclass(frozen=True)
 class EnvelopeMessage(SignedMessage):
-    """Like SignedMessage, but dat_to_sign return only a subset of the fields
+    """Like SignedMessage, but data_to_sign returns only a subset of the fields
 
     Also, define some common properties
     """
@@ -284,12 +306,19 @@ class EnvelopeMessage(SignedMessage):
     locked_amount: int = field(metadata={'format': '32s'})
     locksroot: bytes = field(metadata={'format': '32s'})
     channel: Address = field(metadata={'format': '20s'})
+    message_identifier: int = field(metadata={'format': 'Q'})
+    payment_identifier: int = field(metadata={'format': 'Q'})
 
     def data_to_sign(self) -> bytes:
         """Return only a fields subset for signing"""
-        # Locked amount should get signed when smart contracts change to include it
-        # klass.get_bytes_from(data, 'locked_amount'),
-        _fields = ['nonce', 'transferred_amount', 'locksroot', 'channel']
+        _fields = self._calc_binary_fields([
+            'nonce',
+            'transferred_amount',
+            # Locked amount should get signed when smart contracts change to include it
+            # 'locked_amount',
+            'locksroot',
+            'channel'
+        ])
         data_from_fields = self.to_bytes(_fields=_fields)
         # append message_hash (i.e. self.to_bytes() without 'signature') as extra_hash
         data = data_from_fields + self.hash
@@ -299,8 +328,6 @@ class EnvelopeMessage(SignedMessage):
 @dataclass(frozen=True)
 class Secret(EnvelopeMessage):
     cmdid = 4
-    message_identifier: int = field(metadata={'format': 'Q'})
-    payment_identifier: int = field(metadata={'format': 'Q'})
     secret: bytes = field(metadata={'format': '32s'})
 
     @property
@@ -311,8 +338,57 @@ class Secret(EnvelopeMessage):
 @dataclass(frozen=True)
 class DirectTransfer(EnvelopeMessage):
     cmdid = 5
-    message_identifier: int = field(metadata={'format': 'Q'})
-    payment_identifier: int = field(metadata={'format': 'Q'})
     registry_address: Address = field(metadata={'format': '20s'})
     token: Address = field(metadata={'format': '20s'})
     recipient: Address = field(metadata={'format': '20s'})
+
+
+@dataclass(frozen=True)
+class Lock(Message):
+    expiration: int = field(metadata={'format': 'Q'})
+    amount: int = field(metadata={'format': '32s'})
+    secrethash: bytes = field(metadata={'format': '32s'})
+
+    @classmethod
+    def _prefix_fields(cls) -> Tuple[Field]:
+        # Lock is an internal structure, it doesn't need the prefix
+        return tuple()
+
+    @property
+    def lockhash(self):
+        return self.hash
+
+
+@dataclass(frozen=True)
+class LockedTransfer(EnvelopeMessage):
+    cmdid = 7
+    registry_address: Address = field(metadata={'format': '20s'})
+    token: Address = field(metadata={'format': '20s'})
+    recipient: Address = field(metadata={'format': '20s'})
+    lock: Lock = field(metadata={'format': 'from_calcsize'})
+    target: Address = field(metadata={'format': '20s'})
+    initiator: Address = field(metadata={'format': '20s'})
+    fee: int = field(metadata={'format': '32s'})
+
+
+@dataclass(frozen=True)
+class RefundTransfer(LockedTransfer):
+    cmdid = 8
+
+
+def _get_subclasses(cls: type) -> Iterable[type]:
+    for subclass in cls.__subclasses__():
+        yield from _get_subclasses(subclass)
+        yield subclass
+
+
+_CMDID_TO_CLASS = {
+    cls.cmdid: cls
+    for cls in _get_subclasses(Message)
+    if cls.cmdid is not None
+}
+
+_CLASSNAME_TO_CLASS = {
+    cls.__name__: cls
+    for cls in _get_subclasses(Message)
+}

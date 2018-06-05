@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field, Field, fields, asdict, replace
+from cachetools import LRUCache, cachedmethod
 import struct
 
 from raiden.encoding import signing
@@ -6,9 +7,9 @@ from raiden.utils.typing import (
     ClassVar,
     Dict,
     Tuple,
+    List,
     Iterable,
     Any,
-    Union,
     Optional,
     Address
 )
@@ -24,6 +25,19 @@ def _reveal_type(_type: type) -> type:
         getattr(_type, '__supertype__', None) or
         _type
     )
+
+
+def _internal_cache(cls_or_obj):
+    """Used with cachetools.cachedmethod, stores and returns a cache in the object
+
+    As this function keeps the cache inside the object, it doesn't affect garbage
+    collection, allowing both the object and cache to be deleted when no further
+    reference is found.
+    """
+    cache = cls_or_obj.__dict__.get('__cache')
+    if not cache:
+        cache = cls_or_obj.__dict__['__cache'] = LRUCache(32)
+    return cache
 
 
 @dataclass(frozen=True)
@@ -50,19 +64,18 @@ class BytesEncodableFieldsMixin:
         )
 
     @classmethod
-    def _calc_binary_fields(cls, _fields: Iterable[Union[str, Field]]=None) -> Tuple[Field]:
+    @cachedmethod(_internal_cache)
+    def _calc_binary_fields(cls, _fields: Iterable[Field]=None) -> List[Field]:
         """Calculate the valid _fields iterable to be serialized"""
         # if _fields parameter is set, use list of names in given order,
         # not including self._prefix_fields()
         if _fields:
             _fields = [
-                cls.__dataclass_fields__[field_or_name]
-                if isinstance(field_or_name, str)
-                else field_or_name
-                for field_or_name in _fields
+                cls.__dataclass_fields__[_field.name]
+                for _field in _fields
             ]
         else:  # by default, use all fields, including self._prefix_fields()
-            _fields = cls._prefix_fields() + fields(cls)
+            _fields = list(cls._prefix_fields() + fields(cls))
 
         for _field in _fields:
             _type = _reveal_type(_field.type)
@@ -74,22 +87,23 @@ class BytesEncodableFieldsMixin:
             for _field in _fields
             if getattr(_field, 'metadata', {}).get('format')
         ]
-        return tuple(_fields)
+        return _fields
 
     @classmethod
+    @cachedmethod(_internal_cache)
     def _calc_format(cls, _fields: Iterable[Field]) -> str:
         """Calculate the struct format string to be (en|de)coded"""
         # '!' => network byte-alignment=big-endian
         return '!' + ''.join(_field.metadata['format'] for _field in _fields)
 
     @classmethod
-    def calcsize(cls, _fields: Iterable[Union[str, Field]]=None) -> int:
+    def calcsize(cls, _fields: Iterable[Field]=None) -> int:
         """Caculate the size of the serialized bytes for the given _fields"""
         _fields = cls._calc_binary_fields(_fields=_fields)
         fmt = cls._calc_format(_fields)
         return struct.calcsize(fmt)
 
-    def to_bytes(self, _fields: Iterable[Union[str, Field]]=None) -> bytes:
+    def to_bytes(self, _fields: Iterable[Field]=None) -> bytes:
         """Serializes this object into bytes
 
         The serialization is made based on a 'format' key on field.metadata dict
@@ -120,7 +134,7 @@ class BytesEncodableFieldsMixin:
         return struct.pack(fmt, *values)
 
     @classmethod
-    def from_bytes(cls, data: bytes, _fields: Iterable[Union[str, Field]]=None) -> 'cls':
+    def from_bytes(cls, data: bytes, _fields: Iterable[Field]=None) -> 'cls':
         """Constructs an object based on binary packed data"""
         _fields = cls._calc_binary_fields(_fields=_fields)
         fmt = cls._calc_format(_fields=_fields)
@@ -183,6 +197,7 @@ class DictEncodableFieldsMixin:
 class Message(DictEncodableFieldsMixin, BytesEncodableFieldsMixin):
     """Base for all messages. Includes serialization mixins"""
     @property
+    @cachedmethod(_internal_cache)
     def hash(self):
         return sha3(self.to_bytes())
 
@@ -210,18 +225,21 @@ class SignedMessage(Message):
     signature: bytes = field(metadata={'format': '65s'})
 
     @classmethod
-    def _calc_binary_fields(cls, _fields: Iterable[Union[str, Field]]=None) -> Tuple[Field]:
+    @cachedmethod(_internal_cache)
+    def _calc_binary_fields(cls, _fields: Iterable[Field]=None) -> Tuple[Field]:
         """Like Message._calc_binary_fields, but ensure 'signature' goes last"""
         _fields = super()._calc_binary_fields(_fields=_fields)
         return tuple(sorted(_fields, key=lambda _field: _field.name == 'signature'))
 
     @property
+    @cachedmethod(_internal_cache)
     def hash(self):
         """Exclude 'signature' from SignedMessage.hash calculation"""
         *_fields, sig_field = self._calc_binary_fields()
         assert sig_field.name == 'signature'
         return sha3(self.to_bytes(_fields=_fields))
 
+    @cachedmethod(_internal_cache)
     def data_to_sign(self) -> bytes:
         """Return a binary-encoded representation to be signed
 
@@ -241,6 +259,7 @@ class SignedMessage(Message):
         return replace(self, signature=signature)
 
     @property
+    @cachedmethod(_internal_cache)
     def sender(self) -> Optional[Address]:
         """Returns the address which signed this object
         """
@@ -291,6 +310,7 @@ class RevealSecret(SignedMessage):
     secret: bytes = field(metadata={'format': '32s'})
 
     @property
+    @cachedmethod(_internal_cache)
     def secrethash(self):
         return sha3(self.secret)
 
@@ -309,16 +329,20 @@ class EnvelopeMessage(SignedMessage):
     message_identifier: int = field(metadata={'format': 'Q'})
     payment_identifier: int = field(metadata={'format': 'Q'})
 
+    @cachedmethod(_internal_cache)
     def data_to_sign(self) -> bytes:
         """Return only a fields subset for signing"""
-        _fields = self._calc_binary_fields([
-            'nonce',
-            'transferred_amount',
-            # Locked amount should get signed when smart contracts change to include it
-            # 'locked_amount',
-            'locksroot',
-            'channel'
-        ])
+        _fields = self._calc_binary_fields(
+            self.__dataclass_fields__[name]
+            for name in [
+                'nonce',
+                'transferred_amount',
+                # Locked amount should get signed when smart contracts change to include it
+                # 'locked_amount',
+                'locksroot',
+                'channel'
+            ]
+        )
         data_from_fields = self.to_bytes(_fields=_fields)
         # append message_hash (i.e. self.to_bytes() without 'signature') as extra_hash
         data = data_from_fields + self.hash
@@ -331,6 +355,7 @@ class Secret(EnvelopeMessage):
     secret: bytes = field(metadata={'format': '32s'})
 
     @property
+    @cachedmethod(_internal_cache)
     def secrethash(self):
         return sha3(self.secret)
 
@@ -351,10 +376,11 @@ class Lock(Message):
 
     @classmethod
     def _prefix_fields(cls) -> Tuple[Field]:
-        # Lock is an internal structure, it doesn't need the prefix
+        # Lock is an internal structure, it doesn't need the prefixes
         return tuple()
 
     @property
+    @cachedmethod(_internal_cache)
     def lockhash(self):
         return self.hash
 
